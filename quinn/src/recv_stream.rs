@@ -445,12 +445,10 @@ impl Future for ReadToEnd<'_> {
         loop {
             match ready!(self.stream.poll_read_chunk(cx, usize::MAX, false))? {
                 Some(chunk) => {
-                    self.start = self.start.min(chunk.offset);
-                    let end = chunk.bytes.len() as u64 + chunk.offset;
-                    if (end - self.start) > self.size_limit as u64 {
-                        return Poll::Ready(Err(ReadToEndError::TooLong));
-                    }
-                    self.end = self.end.max(end);
+                    let (start, end) =
+                        read_to_end_bounds(self.start, self.end, &chunk, self.size_limit)?;
+                    self.start = start;
+                    self.end = end;
                     self.read.push((chunk.bytes, chunk.offset));
                 }
                 None => {
@@ -469,6 +467,30 @@ impl Future for ReadToEnd<'_> {
             }
         }
     }
+}
+
+fn read_to_end_bounds(
+    start: u64,
+    end: u64,
+    chunk: &Chunk,
+    limit: usize,
+) -> Result<(u64, u64), ReadToEndError> {
+    let start = start.min(chunk.offset);
+    let end = end.max(chunk.offset + chunk.bytes.len() as u64);
+    if end - start > limit as u64 {
+        return Err(ReadToEndError::TooLong);
+    }
+    Ok((start, end))
+}
+
+#[test]
+fn unordered_read_respects_total_span() {
+    let chunk = |offset| Chunk {
+        offset,
+        bytes: Bytes::from_static(b"x"),
+    };
+    let (start, end) = read_to_end_bounds(u64::MAX, 0, &chunk(4), 4).unwrap();
+    assert!(read_to_end_bounds(start, end, &chunk(0), 4).is_err());
 }
 
 /// Errors from [`RecvStream::read_to_end`]
