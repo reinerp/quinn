@@ -1896,6 +1896,24 @@ fn datagram_send_recv() {
 }
 
 #[test]
+fn datagram_send_buffer_eviction() {
+    let mut config = client_config();
+    Arc::make_mut(&mut config.transport).datagram_send_buffer_size(0);
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect_with(config);
+    for _ in 0..2 {
+        pair.client_datagrams(client)
+            .send(Bytes::from_static(b"x"), true)
+            .unwrap();
+    }
+    pair.drive();
+    assert_eq!(
+        pair.server_datagrams(server).recv(),
+        Some(Bytes::from_static(b"x"))
+    );
+}
+
+#[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
     const PAYLOAD_WINDOW: usize = 100;

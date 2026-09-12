@@ -43,7 +43,8 @@ impl PartialDecode {
         let dgram_len = buf.get_ref().len();
         let packet_len = plain_header
             .payload_len()
-            .map(|len| (buf.position() + len) as usize)
+            .map(|len| checked_packet_len(buf.position(), len, dgram_len))
+            .transpose()?
             .unwrap_or(dgram_len);
         match dgram_len.cmp(&packet_len) {
             Ordering::Equal => Ok((Self { plain_header, buf }, None)),
@@ -217,6 +218,20 @@ impl PartialDecode {
         let len = PacketNumber::decode_len(buf.get_ref()[0]);
         PacketNumber::decode(len, buf)
     }
+}
+
+fn checked_packet_len(
+    header_len: u64,
+    payload_len: u64,
+    dgram_len: usize,
+) -> Result<usize, PacketDecodeError> {
+    header_len
+        .checked_add(payload_len)
+        .filter(|&len| len <= dgram_len as u64)
+        .map(|len| len as usize)
+        .ok_or(PacketDecodeError::InvalidHeader(
+            "packet too short to contain payload length",
+        ))
 }
 
 pub(crate) struct Packet {
@@ -620,11 +635,12 @@ impl ProtectedHeader {
 
             match LongHeaderType::from_byte(first)? {
                 LongHeaderType::Initial => {
-                    let token_len = buf.get_var()? as usize;
+                    let token_len = buf.get_var()?;
                     let token_start = buf.position() as usize;
-                    if token_len > buf.remaining() {
+                    if token_len > buf.remaining() as u64 {
                         return Err(PacketDecodeError::InvalidHeader("token out of bounds"));
                     }
+                    let token_len = token_len as usize;
                     buf.advance(token_len);
 
                     let len = buf.get_var()?;
@@ -901,6 +917,13 @@ mod tests {
     use super::*;
     use hex_literal::hex;
     use std::io;
+
+    #[test]
+    fn packet_length_is_bounded_before_narrowing() {
+        assert_eq!(checked_packet_len(8, 16, 32), Ok(24));
+        assert!(checked_packet_len(8, u32::MAX as u64, 32).is_err());
+        assert!(checked_packet_len(u64::MAX, 1, 32).is_err());
+    }
 
     fn check_pn(typed: PacketNumber, encoded: &[u8]) {
         let mut buf = Vec::new();
