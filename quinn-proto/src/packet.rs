@@ -43,7 +43,15 @@ impl PartialDecode {
         let dgram_len = buf.get_ref().len();
         let packet_len = plain_header
             .payload_len()
-            .map(|len| (buf.position() + len) as usize)
+            .map(|len| {
+                buf.position().checked_add(len)
+                    .filter(|&len| len <= dgram_len as u64)
+                    .map(|len| len as usize)
+                    .ok_or(PacketDecodeError::InvalidHeader(
+                        "packet too short to contain payload length",
+                    ))
+            })
+            .transpose()?
             .unwrap_or(dgram_len);
         match dgram_len.cmp(&packet_len) {
             Ordering::Equal => Ok((Self { plain_header, buf }, None)),
@@ -620,11 +628,12 @@ impl ProtectedHeader {
 
             match LongHeaderType::from_byte(first)? {
                 LongHeaderType::Initial => {
-                    let token_len = buf.get_var()? as usize;
+                    let token_len = buf.get_var()?;
                     let token_start = buf.position() as usize;
-                    if token_len > buf.remaining() {
+                    if token_len > buf.remaining() as u64 {
                         return Err(PacketDecodeError::InvalidHeader("token out of bounds"));
                     }
+                    let token_len = token_len as usize;
                     buf.advance(token_len);
 
                     let len = buf.get_var()?;
