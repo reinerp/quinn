@@ -193,6 +193,9 @@ pub struct Connection {
     timers: TimerTable,
     /// Number of packets received which could not be authenticated
     authentication_failures: u64,
+    /// Authenticated 1-RTT packets that arrived before the handshake completed, to be processed
+    /// once it has (RFC 9000 section 5.7)
+    early_1rtt: Vec<EarlyPacket>,
     /// Why the connection was lost, if it has been
     error: Option<ConnectionError>,
     /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
@@ -319,6 +322,7 @@ impl Connection {
             },
             timers: TimerTable::default(),
             authentication_failures: 0,
+            early_1rtt: Vec::new(),
             error: None,
             #[cfg(test)]
             packet_number_filter: match config.deterministic_packet_numbers {
@@ -2311,8 +2315,21 @@ impl Connection {
                     debug!("discarding possible duplicate packet");
                     return;
                 } else if self.state.is_handshake() && packet.header.is_short() {
-                    // TODO: SHOULD buffer these to improve reordering tolerance.
-                    trace!("dropping short packet during handshake");
+                    // A server has 1-RTT keys before the handshake completes, but must not
+                    // process 1-RTT packets until it does. A client's first 1-RTT packets (e.g.
+                    // a request sent right after its Finished) can overtake the Finished, so
+                    // keep a few rather than forcing the client to wait for a retransmission.
+                    if self.early_1rtt.len() < MAX_EARLY_1RTT_PACKETS {
+                        trace!("buffering short packet during handshake");
+                        self.early_1rtt.push(EarlyPacket {
+                            remote,
+                            ecn,
+                            number,
+                            packet,
+                        });
+                    } else {
+                        trace!("dropping short packet during handshake");
+                    }
                     return;
                 } else {
                     if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
@@ -2347,6 +2364,55 @@ impl Connection {
             }
         };
 
+        self.finish_packet(now, remote, result, was_closed, was_drained);
+
+        if !self.early_1rtt.is_empty() && !self.state.is_handshake() {
+            // The handshake just completed (or failed). Process what arrived early, in order.
+            for early in mem::take(&mut self.early_1rtt) {
+                if !matches!(self.state, State::Established) {
+                    break;
+                }
+                let EarlyPacket {
+                    remote,
+                    ecn,
+                    number,
+                    packet,
+                } = early;
+                let span = match number {
+                    Some(pn) => trace_span!("recv", space = ?packet.header.space(), pn),
+                    None => trace_span!("recv", space = ?packet.header.space()),
+                };
+                let _guard = span.enter();
+                trace!("processing short packet buffered during handshake");
+                let was_closed = self.state.is_closed();
+                let was_drained = self.state.is_drained();
+                let spin = match packet.header {
+                    Header::Short { spin, .. } => spin,
+                    _ => false,
+                };
+                self.on_packet_authenticated(
+                    now,
+                    packet.header.space(),
+                    ecn,
+                    number,
+                    spin,
+                    packet.header.is_1rtt(),
+                );
+                let result = self.process_decrypted_packet(now, remote, number, packet);
+                self.finish_packet(now, remote, result, was_closed, was_drained);
+            }
+        }
+    }
+
+    /// Apply the state transitions that follow processing a packet
+    fn finish_packet(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        result: Result<(), ConnectionError>,
+        was_closed: bool,
+        was_drained: bool,
+    ) {
         // State transitions for error cases
         if let Err(conn_err) = result {
             self.error = Some(conn_err.clone());
@@ -3984,6 +4050,17 @@ fn get_max_ack_delay(params: &TransportParameters) -> Duration {
 
 // Prevents overflow and improves behavior in extreme circumstances
 const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+/// Maximum number of 1-RTT packets buffered while the handshake completes
+const MAX_EARLY_1RTT_PACKETS: usize = 16;
+
+/// An authenticated 1-RTT packet received before the handshake completed
+struct EarlyPacket {
+    remote: SocketAddr,
+    ecn: Option<EcnCodepoint>,
+    number: Option<u64>,
+    packet: Packet,
+}
 
 /// Minimal remaining size to allow packet coalescing, excluding cryptographic tag
 ///

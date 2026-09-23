@@ -100,6 +100,9 @@ pub struct StreamsState {
     /// This differs from `self.send.len()` in that it does not include streams that the peer is
     /// permitted to open but which have not yet been opened.
     pub(super) send_streams: usize,
+    /// Whether an attempt to open a stream failed for lack of stream budget since the budget was
+    /// last raised
+    pub(super) open_blocked: [bool; 2],
     /// Streams with outgoing data queued, sorted by priority
     pub(super) pending: PendingStreamsQueue,
 
@@ -165,6 +168,7 @@ impl StreamsState {
             opened: [false, false],
             next_reported_remote: [0, 0],
             send_streams: 0,
+            open_blocked: [false, false],
             pending: PendingStreamsQueue::new(),
             events: VecDeque::new(),
             connection_blocked: Vec::new(),
@@ -196,8 +200,20 @@ impl StreamsState {
         self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
         self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
         self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
-        self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
-        self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
+        for (dir, count) in [
+            (Dir::Bi, params.initial_max_streams_bidi),
+            (Dir::Uni, params.initial_max_streams_uni),
+        ] {
+            let count = count.into();
+            let current = &mut self.max[dir as usize];
+            // A server can try to open streams (0.5-RTT data) before the client's transport
+            // parameters have arrived, while the limit is still zero. Wake such openers the
+            // same way a MAX_STREAMS frame would.
+            if count > *current && mem::take(&mut self.open_blocked[dir as usize]) {
+                self.events.push_back(StreamEvent::Available { dir });
+            }
+            *current = count;
+        }
         self.received_max_data(params.initial_max_data);
         for i in 0..self.max_remote[Dir::Bi as usize] {
             let id = StreamId::new(!self.side, Dir::Bi, i);
@@ -715,6 +731,7 @@ impl StreamsState {
         let current = &mut self.max[dir as usize];
         if count > *current {
             *current = count;
+            self.open_blocked[dir as usize] = false;
             self.events.push_back(StreamEvent::Available { dir });
         }
 
